@@ -1,4 +1,4 @@
-# Long Endoscope Video Generation
+# Conditional Endoscope Video Generation
 
 Currently, source code have been in modification.
 
