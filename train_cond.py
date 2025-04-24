@@ -7,7 +7,7 @@ torch.backends.cudnn.allow_tf32 = True
 import io
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES']='0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['RANK'] = '0'
 os.environ['WORLD_SIZE'] = '1'
 os.environ['MASTER_ADDR'] = '127.0.0.1'
@@ -30,10 +30,11 @@ from transformers import CLIPProcessor, CLIPModel
 from diffusers.optimization import get_scheduler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from utils import (clip_grad_norm_, create_logger, update_ema, 
-                   requires_grad, cleanup, create_tensorboard, 
+from utils import (clip_grad_norm_, create_logger, update_ema,
+                   requires_grad, cleanup, create_tensorboard,
                    write_tensorboard, setup_distributed, get_experiment_dir)
 import models.vision_transformer as vits
+
 
 #################################################################################
 #                                  Training Loop                                #
@@ -41,8 +42,8 @@ import models.vision_transformer as vits
 
 def load_model(device, pretrained_path):
     model = vits.__dict__["vit_small"](
-            patch_size=8, num_classes=0
-        )
+        patch_size=8, num_classes=0
+    )
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -64,7 +65,6 @@ def load_model(device, pretrained_path):
 
 
 def main(args, port, pretrained_weights, mode, prr_weight):
-
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     os.environ['MASTER_PORT'] = str(port)
     # Setup DDP:
@@ -81,7 +81,7 @@ def main(args, port, pretrained_weights, mode, prr_weight):
 
     # Setup an experiment folder:
     if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True) # Make results folder (holds all experiment subfolders)
+        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = 1
         model_string_name = args.model.replace("/", "-")  # e.g., EnDora-XL/2 --> EnDora-XL-2 (for naming folders)
         num_frame_string = 'F' + str(args.num_frames) + 'S' + str(args.frame_interval)
@@ -126,7 +126,8 @@ def main(args, port, pretrained_weights, mode, prr_weight):
                 pretrained_dict[k] = v
             else:
                 logger.info('Ignoring: {}'.format(k))
-        logger.info('Successfully Load {}% original pretrained model weights '.format(len(pretrained_dict) / len(checkpoint.items()) * 100))
+        logger.info('Successfully Load {}% original pretrained model weights '.format(
+            len(pretrained_dict) / len(checkpoint.items()) * 100))
         # 2. overwrite entries in the existing state dict
         model_dict.update(pretrained_dict)
         model.load_state_dict(model_dict)
@@ -145,7 +146,7 @@ def main(args, port, pretrained_weights, mode, prr_weight):
 
     if args.fixed_spatial:
         trainable_modules = (
-        "attn_temp",
+            "attn_temp",
         )
         model.requires_grad_(False)
         for name, module in model.named_modules():
@@ -167,7 +168,7 @@ def main(args, port, pretrained_weights, mode, prr_weight):
 
     # Setup data:
     dataset = get_dataset(args)
-        
+
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -185,7 +186,7 @@ def main(args, port, pretrained_weights, mode, prr_weight):
         drop_last=True
     )
     logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_path})")
-    
+
     # Scheduler
     lr_scheduler = get_scheduler(
         name="constant",
@@ -227,6 +228,8 @@ def main(args, port, pretrained_weights, mode, prr_weight):
         for step, video_data in enumerate(loader):
 
             x = video_data['video'].to(device, non_blocking=True)
+            if args.extras == 3:
+                c = video_data['video_mask'].to(device, non_blocking=True)
 
             img = rearrange(x, 'b f c h w -> (b f) c h w').contiguous()
             patch_size = 8
@@ -242,22 +245,32 @@ def main(args, port, pretrained_weights, mode, prr_weight):
             attentions = [item[:, 1:, :] for item in attentions]
 
             video_name = video_data['video_name']
-
             with torch.no_grad():
+
+                # concatenate input with mask
+                # x = torch.concatenate([x, c], dim=1)
+
                 # Map input images to latent space + normalize latents:
                 b, _, _, _, _ = x.shape
                 x = rearrange(x, 'b f c h w -> (b f) c h w').contiguous()
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
                 x = rearrange(x, '(b f) c h w -> b f c h w', b=b).contiguous()
 
+                if args.extras == 3:
+                    c = rearrange(c, 'b f c h w -> (b f) c h w').contiguous()
+                    c = vae.encode(c).latent_dist.sample().mul_(0.18215)
+                    c = rearrange(c, '(b f) c h w -> b f c h w', b=b).contiguous()
+
             if args.extras == 2:
-                model_kwargs = dict(y=video_name) # tav unet
+                model_kwargs = dict(y=video_name)  # tav unet
             else:
                 model_kwargs = dict(y=None, use_image_num=args.use_image_num)
 
             model_kwargs["attentions"] = attentions
             model_kwargs["special_list"] = special_list
             model_kwargs["mode"] = mode
+            if args.extras == 3:
+                model_kwargs["y_image"] = c
 
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -269,7 +282,7 @@ def main(args, port, pretrained_weights, mode, prr_weight):
                 loss = loss_mse
             loss.backward()
 
-            if train_steps < args.start_clip_iter: # if train_steps >= start_clip_iter, will clip gradient
+            if train_steps < args.start_clip_iter:  # if train_steps >= start_clip_iter, will clip gradient
                 gradient_norm = clip_grad_norm_(model.module.parameters(), args.clip_max_norm, clip_grad=False)
             else:
                 gradient_norm = clip_grad_norm_(model.module.parameters(), args.clip_max_norm, clip_grad=True)

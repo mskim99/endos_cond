@@ -101,7 +101,7 @@ class TimestepEmbedder(nn.Module):
     def timestep_embedding(t, dim, max_period=10000):
         """
         Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
+        :param t: a polypgen_mask-D Tensor of N indices, one per batch element.
                           These  be fractional.
         :param dim: the dimension of the output.
         :param max_period: controls the minimum frequency of the embeddings.
@@ -234,15 +234,9 @@ class EnDora(nn.Module):
         self.num_frames = num_frames
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        if self.extras == 3:
+            self.y_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-
-        if self.extras == 2:
-            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        if self.extras == 78: # timestep + text_embedding
-            self.text_embedding_projection = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(1024, hidden_size, bias=True)
-        )
 
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
@@ -258,7 +252,11 @@ class EnDora(nn.Module):
             TransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, attention_mode=attention_mode) for _ in range(depth)
         ])
 
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        if self.extras == 3:
+            self.final_layer = FinalLayer(hidden_size, patch_size, int(self.out_channels / 2))
+        else:
+            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -341,100 +339,34 @@ class EnDora(nn.Module):
         if use_fp16:
             x = x.to(dtype=torch.float16)
 
-        if attentions is not None and mode == "type1":
-            # attentions = torch.tensor(attentions, device=attentions[0].device)
-            attentions = torch.concatenate(attentions, dim=0)
-            # attentions.requires_grad = True
-            attentions = attentions.permute(0, 2, 1)
-            n = 4
-            b, c, h = attentions.shape
-            attentions = self.pooling(attentions)
-            # attentions = rearrange(attentions, '(b f) c h -> b f c h', b=batch_size).contiguous()
-            attentions = attentions.permute(0, 2, 1)
-            attentions = rearrange(attentions, 'b h c  -> (b h) c ').contiguous()
-            attentions = self.linear(attentions)
-            # attentions = attentions.permute(0, 2, 1)
-            attentions = rearrange(attentions, '(b f) c  -> b f c ', b=n).contiguous()
-            attentions = rearrange(attentions, 'b (n f) c  -> b n f c ', n=int(b/n)).contiguous()
-            attentions = rearrange(attentions, 'b n f c  -> (b n) f c ', n=int(b/n)).contiguous()
-            # attentions = attentions.permute(0, 1, 3, 2)
+        attentions = torch.concatenate(attentions, dim=0) # 480,256,384
+        attentions = attentions.permute(0, 2, 1)
+        attentions = rearrange(attentions, 'b h (m n) -> b h m n', n=16).contiguous() # 480,384,16,16
+        attentions = self.cov(attentions) # 480,1152, 8,8
+        attentions = rearrange(attentions, 'b h m n -> b h (m n)').contiguous() # 480,1152, 64
+        attentions = attentions.permute(0, 2, 1) # 480,64,1152
 
-        elif attentions is not None and mode == "type_cnn":
-            attentions = torch.concatenate(attentions, dim=0) # 480,256,384
-            # attentions.requires_grad = True
-            attentions = attentions.permute(0, 2, 1)
-            attentions = rearrange(attentions, 'b h (m n) -> b h m n', n=16).contiguous() # 480,384,16,16
-            attentions = self.cov(attentions) # 480,1152, 8,8
-            attentions = rearrange(attentions, 'b h m n -> b h (m n)').contiguous() # 480,1152, 64
-            attentions = attentions.permute(0, 2, 1) # 480,64,1152
-
-        elif attentions is not None and mode =="type2":
-            attentions = torch.concatenate(attentions, dim=-1)
-            # attentions.requires_grad = True
-            attentions = attentions.permute(0, 2, 1)
-            attentions = self.pooling(attentions)
-            attentions = attentions.permute(0, 2, 1)
-            b, h, c = attentions.shape
-            attentions = rearrange(attentions, 'b h c  -> (b h) c ').contiguous()
-            attentions = self.linear_2(attentions)
-            # attentions = rearrange(attentions, '(b h) c  -> b h c ', b=b).contiguous()
-
-
-        batches, frames, channels, high, weight = x.shape 
+        batches, frames, channels, high, weight = x.shape
         x = rearrange(x, 'b f c h w -> (b f) c h w')
-        x = self.x_embedder(x) + self.pos_embed  
-        t = self.t_embedder(t, use_fp16=use_fp16)              
+        x = self.x_embedder(x) + self.pos_embed
+        t = self.t_embedder(t, use_fp16=use_fp16)
         timestep_spatial = repeat(t, 'n d -> (n c) d', c=self.temp_embed.shape[1] + use_image_num)
-        timestep_temp = repeat(t, 'n d -> (n c) d', c=self.pos_embed.shape[1]) 
+        if self.extras == 3:
+            timestep_temp = repeat(t, 'n d -> (n c) d', c=self.pos_embed.shape[1]*2)
+        else:
+            timestep_temp = repeat(t, 'n d -> (n c) d', c=self.pos_embed.shape[1])
 
-        if self.extras == 2:
-            y = self.y_embedder(y, self.training)
-            if self.training:
-                y_image_emb = []
-                # print(y_image)
-                for y_image_single in y_image:
-                    # print(y_image_single)
-                    y_image_single = y_image_single.reshape(1, -1)
-                    y_image_emb.append(self.y_embedder(y_image_single, self.training))
-                y_image_emb = torch.cat(y_image_emb, dim=0)
-                y_spatial = repeat(y, 'n d -> n c d', c=self.temp_embed.shape[1])
-                y_spatial = torch.cat([y_spatial, y_image_emb], dim=1)
-                y_spatial = rearrange(y_spatial, 'n c d -> (n c) d')
-            else:
-                y_spatial = repeat(y, 'n d -> (n c) d', c=self.temp_embed.shape[1]) 
-            
-            y_temp = repeat(y, 'n d -> (n c) d', c=self.pos_embed.shape[1])
-        elif self.extras == 78:
-            text_embedding = self.text_embedding_projection(text_embedding)
-            text_embedding_video = text_embedding[:, :1, :]
-            text_embedding_image = text_embedding[:, 1:, :]
-            text_embedding_video = repeat(text_embedding, 'n t d -> n (t c) d', c=self.temp_embed.shape[1])
-            text_embedding_spatial = torch.cat([text_embedding_video, text_embedding_image], dim=1)
-            text_embedding_spatial = rearrange(text_embedding_spatial, 'n t d -> (n t) d')
-            text_embedding_temp = repeat(text_embedding_video, 'n t d -> n (t c) d', c=self.pos_embed.shape[1])
-            text_embedding_temp = rearrange(text_embedding_temp, 'n t d -> (n t) d')
+        if self.extras == 3:
+            y_image = rearrange(y_image, 'b f c h w -> (b f) c h w')
+            y_cond = self.y_embedder(y_image) + self.pos_embed
+            x = torch.cat([x, y_cond], dim=1)
 
         output = []
         for i in range(0, len(self.blocks), 2):
             spatial_block, temp_block = self.blocks[i:i+2]
 
-            if self.extras == 2:
-                c = timestep_spatial + y_spatial
-            elif self.extras == 78:
-                c = timestep_spatial + text_embedding_spatial
-            else:
-                c = timestep_spatial
-            
-            # if i // 2 in special_list and mode == "type1":
-            #     idx = i // 2
-            #     idx2 = special_list.index(idx)
-            #     val = attentions[idx2]
-            #     x += val
-            #     # print("add successfully at: layer", idx)
-            # elif i // 2 in special_list and mode == "type2":
-            #     idx = i // 2
-            #     x += attentions
-                
+            c = timestep_spatial
+
             x  = spatial_block(x, c)
             if i // 2 in special_list:
                 output.append(x)
@@ -445,31 +377,24 @@ class EnDora(nn.Module):
             
             # Add Time Embedding
             if i == 0:
-                x_video = x_video + self.temp_embed 
+                x_video = x_video + self.temp_embed
 
-            if self.extras == 2:
-                c = timestep_temp + y_temp
-            elif self.extras == 78:
-                c = timestep_temp + text_embedding_temp
-            else:
-                c = timestep_temp
+            c = timestep_temp
 
             x_video = temp_block(x_video, c)
             x = torch.cat([x_video, x_image], dim=1)
             x = rearrange(x, '(b t) f d -> (b f) t d', b=batches)
 
-        if self.extras == 2:
-            c = timestep_spatial + y_spatial
-        else:
-            c = timestep_spatial
-        x = self.final_layer(x, c)              
-        x = self.unpatchify(x)                  
+        c = timestep_spatial
+        x = self.final_layer(x, c)
+        if self.extras == 3:
+            x = x.view(x.shape[0], int(x.shape[1]/2), x.shape[2]*2)
+        x = self.unpatchify(x)
         x = rearrange(x, '(b f) c h w -> b f c h w', b=batches)
-        # print(x.shape)
-        if attentions is not None:
-            features = torch.concatenate(output, dim=0) #480,64,1152
-        else:
-            features = attentions
+        features = torch.concatenate(output, dim=0) #480,64,1152
+        if self.extras == 3:
+            features = features.view(features.shape[0], int(features.shape[1]/2), features.shape[2]*2)
+
         return x, attentions, features
 
 
@@ -644,11 +569,11 @@ class EnDora_var(nn.Module):
             attentions = attentions.permute(0, 2, 1)
             attentions = rearrange(attentions, 'b h c  -> (b h) c ').contiguous()
             attentions = self.linear(attentions)
-            # attentions = attentions.permute(0, 2, 1)
+            # attentions = attentions.permute(0, 2, polypgen_mask)
             attentions = rearrange(attentions, '(b f) c  -> b f c ', b=n).contiguous()
             attentions = rearrange(attentions, 'b (n f) c  -> b n f c ', n=int(b/n)).contiguous()
             attentions = rearrange(attentions, 'b n f c  -> (b n) f c ', n=int(b/n)).contiguous()
-            # attentions = attentions.permute(0, 1, 3, 2)
+            # attentions = attentions.permute(0, polypgen_mask, 3, 2)
         elif attentions is not None and mode =="type2":
             attentions = torch.concatenate(attentions, dim=-1)
             attentions.requires_grad = True
@@ -668,8 +593,8 @@ class EnDora_var(nn.Module):
         timestep_spatial = repeat(t, 'n d -> (n c) d', c=self.temp_embed.shape[1] + use_image_num)
         timestep_temp = repeat(t, 'n d -> (n c) d', c=self.pos_embed.shape[1]) 
 
-        if self.extras == 2:
-            y = self.y_embedder(y, self.training)
+        if self.extras == 3:
+            # y = self.y_embedder(y, self.training)
             if self.training:
                 y_image_emb = []
                 # print(y_image)
@@ -685,25 +610,12 @@ class EnDora_var(nn.Module):
                 y_spatial = repeat(y, 'n d -> (n c) d', c=self.temp_embed.shape[1]) 
             
             y_temp = repeat(y, 'n d -> (n c) d', c=self.pos_embed.shape[1])
-        elif self.extras == 78:
-            text_embedding = self.text_embedding_projection(text_embedding)
-            text_embedding_video = text_embedding[:, :1, :]
-            text_embedding_image = text_embedding[:, 1:, :]
-            text_embedding_video = repeat(text_embedding, 'n t d -> n (t c) d', c=self.temp_embed.shape[1])
-            text_embedding_spatial = torch.cat([text_embedding_video, text_embedding_image], dim=1)
-            text_embedding_spatial = rearrange(text_embedding_spatial, 'n t d -> (n t) d')
-            text_embedding_temp = repeat(text_embedding_video, 'n t d -> n (t c) d', c=self.pos_embed.shape[1])
-            text_embedding_temp = rearrange(text_embedding_temp, 'n t d -> (n t) d')
 
         output = []
         for i in range(0, len(self.blocks) // 2):
             spatial_block = self.blocks[i]
-            if self.extras == 2:
-                c = timestep_spatial + y_spatial
-            elif self.extras == 78:
-                c = timestep_spatial + text_embedding_spatial
-            else:
-                c = timestep_spatial
+
+            c = timestep_spatial
             x  = spatial_block(x, c)
 
         for i in range(len(self.blocks)//2, len(self.blocks)):
@@ -714,7 +626,7 @@ class EnDora_var(nn.Module):
             if i == len(self.blocks)//2:
                 x_video = x_video + self.temp_embed 
             
-            if self.extras == 2:
+            if self.extras == 3:
                 c = timestep_temp + y_temp
             elif self.extras == 78:
                 c = timestep_temp + text_embedding_temp
@@ -774,7 +686,7 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
     """
     grid_size: int of the grid height and width
     return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    pos_embed: [grid_size*grid_size, embed_dim] or [polypgen_mask+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
     """
     grid_h = np.arange(grid_size, dtype=np.float32)
     grid_w = np.arange(grid_size, dtype=np.float32)

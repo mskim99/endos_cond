@@ -127,6 +127,98 @@ class ColonoscopicImages(torch.utils.data.Dataset):
         return len(self.video_frame_files)
 
 
+class ColonoscopicImageMaskPairs(torch.utils.data.Dataset):
+    """Load the FaceForensics video files
+
+    Args:
+        target_video_len (int): the number of video frames will be load.
+        align_transform (callable): Align different videos in a specified size.
+        temporal_sample (callable): Sample the target length of a video.
+    """
+
+    def __init__(self,
+                 configs,
+                 transform=None,
+                 temporal_sample=None):
+        self.configs = configs
+        self.video_lists = get_filelist(configs.data_path)
+        self.mask_video_lists = get_filelist(configs.mask_data_path)
+        self.transform = transform
+        self.temporal_sample = temporal_sample
+        self.target_video_len = self.configs.num_frames
+        self.v_decoder = DecordInit()
+        self.video_length = len(self.video_lists)
+
+        # ffs video frames
+        self.video_frame_path = configs.frame_data_path
+        self.video_frame_txt = configs.frame_data_txt
+        self.video_frame_files = [frame_file.strip() for frame_file in open(self.video_frame_txt)]
+
+        # ffs video mask frames`
+        self.video_mask_path = configs.mask_frame_data_path
+        self.video_mask_txt = configs.mask_data_txt
+        self.video_mask_files = [mask_file.strip() for mask_file in open(self.video_mask_txt)]
+
+        self.use_image_num = configs.use_image_num
+        self.image_tranform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+
+    def __getitem__(self, index):
+        video_index = index % self.video_length
+        path = self.video_lists[video_index]
+        mask_path = self.mask_video_lists[video_index]
+        vframes, aframes, info = torchvision.io.read_video(filename=path, pts_unit='sec', output_format='TCHW')
+        vframes_m, aframes_m, info_m = torchvision.io.read_video(filename=mask_path, pts_unit='sec', output_format='TCHW')
+        total_frames = len(vframes)
+
+        start_frame_ind, end_frame_ind = self.temporal_sample(total_frames)
+        assert end_frame_ind - start_frame_ind >= self.target_video_len
+        frame_indice = np.linspace(start_frame_ind, end_frame_ind - 1, self.target_video_len, dtype=int)
+
+        # Sampling image video frames
+        video = vframes[frame_indice]
+        # videotransformer data proprecess
+        video = self.transform(video)  # T C H W
+
+        # Sampling mask video frames
+        video_m = vframes_m[frame_indice]
+        # videotransformer data proprecess
+        video_m = self.transform(video_m)  # T C H W
+
+        # get video frames
+        images = []
+        masks = []
+        for i in range(self.use_image_num):
+            while True:
+                try:
+                    image = Image.open(os.path.join(self.video_frame_path, self.video_frame_files[index + i])).convert(
+                        "RGB")
+                    image = self.image_tranform(image).unsqueeze(0)
+                    images.append(image)
+                    mask = Image.open(os.path.join(self.video_mask_path, self.video_mask_files[index + i])).convert(
+                        "RGB")
+                    mask = self.image_tranform(mask).unsqueeze(0)
+                    masks.append(mask)
+                    break
+                except Exception as e:
+                    # traceback.print_exc()
+                    index = random.randint(0, len(self.video_frame_files) - self.use_image_num)
+        images = torch.cat(images, dim=0)
+        masks = torch.cat(masks, dim=0)
+
+        assert len(images) == self.use_image_num
+        assert len(masks) == self.use_image_num
+
+        video_cat = torch.cat([video, images], dim=0)
+        video_cat_m = torch.cat([video_m, masks], dim=0)
+
+        return {'video': video_cat, 'video_mask': video_cat_m, 'video_name': 1}
+
+    def __len__(self):
+        return len(self.video_frame_files)
+
 if __name__ == '__main__':
     import argparse
     import torchvision
@@ -165,7 +257,7 @@ if __name__ == '__main__':
         # print(image_label)
         print(video.shape)
         print(video_label)
-        # video_ = ((video[0] * 0.5 + 0.5) * 255).add_(0.5).clamp_(0, 255).to(dtype=torch.uint8).cpu().permute(0, 2, 3, 1)
+        # video_ = ((video[0] * 0.5 + 0.5) * 255).add_(0.5).clamp_(0, 255).to(dtype=torch.uint8).cpu().permute(0, 2, 3, polypgen_mask)
         # print(video_.shape)
         # try:
         #     torchvision.io.write_video(f'./test/{i:03d}_{video_label}.mp4', video_[:16], fps=8)

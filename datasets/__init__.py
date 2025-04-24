@@ -2,6 +2,7 @@ from torchvision import transforms
 from datasets import video_transforms
 from .col_datasets import Colonoscopic
 from .col_image_datasets import ColonoscopicImages
+from .col_image_datasets import ColonoscopicImageMaskPairs
 from .endoslam_image_datasets import EndoslamImages
 from .kva_datasets import Kvasir_Capsule
 from .cho_image_datasets import CholecT45Images
@@ -44,6 +45,15 @@ def get_dataset(args):
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
         return ColonoscopicImages(args, transform=transform_col, temporal_sample=temporal_sample)
+
+    elif args.dataset == 'polypgen_img_mask':
+        transform_col = transforms.Compose([
+            video_transforms.ToTensorVideo(), # TCHW
+            video_transforms.RandomHorizontalFlipVideo(),
+            video_transforms.UCFCenterCropVideo(args.image_size),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+        return ColonoscopicImageMaskPairs(args, transform=transform_col, temporal_sample=temporal_sample)
 
     elif args.dataset == "kva":
         transform_kva = transforms.Compose([
