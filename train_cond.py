@@ -219,7 +219,7 @@ def main(args, port, pretrained_weights, mode, prr_weight):
         states = torch.load(args.resume_from_checkpoint)
         model.module.load_state_dict(states['ema'])
         del states
-        train_steps = 40000
+        train_steps = 20000
 
         first_epoch = train_steps // num_update_steps_per_epoch
 

@@ -246,7 +246,7 @@ class EnDora(nn.Module):
         self.pooling = nn.AdaptiveAvgPool1d(64)
         self.linear = nn.Linear(in_features=384, out_features=1152)
         self.linear_2 = nn.Linear(in_features=384*4, out_features=1152)
-        self.cov = nn.Conv2d(in_channels=384, out_channels=1152, kernel_size=2, stride=2, bias=False)
+        self.cov = nn.Conv2d(in_channels=384, out_channels=1152, kernel_size=2, stride=2, bias=False) # out_channels=1152
 
         self.blocks = nn.ModuleList([
             TransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, attention_mode=attention_mode) for _ in range(depth)
@@ -256,8 +256,6 @@ class EnDora(nn.Module):
             self.final_layer = FinalLayer(hidden_size, patch_size, int(self.out_channels / 2))
         else:
             self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-
-        self.initialize_weights()
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -314,6 +312,21 @@ class EnDora(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
+    def unpatchify_cond(self, x):
+        """
+        x: (N, T, 1.5 * patch_size**2 * C)
+        imgs: (N, H, W, C)
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int((x.shape[1] / 2) ** 0.5)
+        assert h * w == int(x.shape[1] / 2)
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+
     # @torch.cuda.amp.autocast()
     # @torch.compile
     def forward(
@@ -339,12 +352,13 @@ class EnDora(nn.Module):
         if use_fp16:
             x = x.to(dtype=torch.float16)
 
-        attentions = torch.concatenate(attentions, dim=0) # 480,256,384
-        attentions = attentions.permute(0, 2, 1)
-        attentions = rearrange(attentions, 'b h (m n) -> b h m n', n=16).contiguous() # 480,384,16,16
-        attentions = self.cov(attentions) # 480,1152, 8,8
-        attentions = rearrange(attentions, 'b h m n -> b h (m n)').contiguous() # 480,1152, 64
-        attentions = attentions.permute(0, 2, 1) # 480,64,1152
+        if attentions is not None:
+            attentions = torch.concatenate(attentions, dim=0) # 480,256,384
+            attentions = attentions.permute(0, 2, 1)
+            attentions = rearrange(attentions, 'b h (m n) -> b h m n', n=16).contiguous() # 480,384,16,16
+            attentions = self.cov(attentions) # 480,1152, 8,8
+            attentions = rearrange(attentions, 'b h m n -> b h (m n)').contiguous() # 480,1152, 64
+            attentions = attentions.permute(0, 2, 1) # 480,64,1152
 
         batches, frames, channels, high, weight = x.shape
         x = rearrange(x, 'b f c h w -> (b f) c h w')
@@ -374,7 +388,7 @@ class EnDora(nn.Module):
             x = rearrange(x, '(b f) t d -> (b t) f d', b=batches)
             x_video = x[:, :(frames-use_image_num), :]
             x_image = x[:, (frames-use_image_num):, :]
-            
+
             # Add Time Embedding
             if i == 0:
                 x_video = x_video + self.temp_embed
@@ -387,15 +401,19 @@ class EnDora(nn.Module):
 
         c = timestep_spatial
         x = self.final_layer(x, c)
-        if self.extras == 3:
-            x = x.view(x.shape[0], int(x.shape[1]/2), x.shape[2]*2)
-        x = self.unpatchify(x)
-        x = rearrange(x, '(b f) c h w -> b f c h w', b=batches)
-        features = torch.concatenate(output, dim=0) #480,64,1152
-        if self.extras == 3:
-            features = features.view(features.shape[0], int(features.shape[1]/2), features.shape[2]*2)
 
-        return x, attentions, features
+        if self.extras == 3:
+            x = self.unpatchify_cond(x)
+        else:
+            x = self.unpatchify(x)
+        x = rearrange(x, '(b f) c h w -> b f c h w', b=batches)
+        if output:
+            features = torch.concatenate(output, dim=0) #480,64,1152
+
+        if attentions is None and not output:
+            return x
+        else:
+            return x, attentions, features
 
 
     def forward_with_cfg(self, x, t, y, cfg_scale, use_fp16=False):

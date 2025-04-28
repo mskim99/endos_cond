@@ -87,15 +87,15 @@ def main(args):
     ])
 
     if args.ckpt is None:
-        assert args.model == "EnDora-XL/2", "Only EnDora-XL/2 models are available for auto-download."
-        assert args.image_size in [256, 512]
-        assert args.num_classes == 1000
+        print('ckpt Path Not available')
+        exit(-1)
 
     using_cfg = args.cfg_scale > 1.0
 
     # Load model:
     latent_size = args.image_size // 8
     args.latent_size = latent_size
+    print(args.model)
     model = get_models(args).to(device)
 
     if args.use_compile:
@@ -122,7 +122,7 @@ def main(args):
     # Labels to condition the model with (feel free to change):
 
     # Create sampling noise:
-    for idx in range (1, 4):
+    for idx in range (1, 17):
         if args.use_fp16:
             z = torch.randn(1, args.num_frames, 4, latent_size, latent_size, dtype=torch.float16, device=device) # b c f h w
         else:
@@ -143,29 +143,6 @@ def main(args):
         # videotransformer data proprecess
         video_m = transform_col(video_m)  # T C H W
 
-        # get video frames
-        '''
-        masks = []
-        image_paths = glob.glob('/home/work/polypgen/CVC-ClinicDB/mask/' + str(idx).zfill(5) + '/*.jpg')
-        random.shuffle(image_paths)
-        for i in range(args.use_image_num):
-            while True:
-                try:
-                    mask = Image.open(image_paths[index + i]).convert("RGB")
-                    mask = image_tranform(mask).unsqueeze(0)
-                    masks.append(mask)
-                    break
-                except Exception as e:
-                    # traceback.print_exc()
-                    index = random.randint(0, len(image_paths) - args.use_image_num)
-        masks = torch.cat(masks, dim=0)
-
-        assert len(masks) == args.use_image_num
-
-        print(video_m.shape)
-        print(masks.shape)
-        c = torch.cat([video_m, masks], dim=0).contiguous()
-        '''
         c = video_m.contiguous().cuda()
 
         vae.requires_grad_(False)
